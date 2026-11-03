@@ -27,13 +27,11 @@ Tap the status pill (top left) to pick your brush, and close the Philips app fir
 | Pavilion, Pagoda | Poly by Google | CC-BY 3.0 |
 | Red Lantern | Sophie Kim | CC-BY 3.0 |
 
-All were downloaded from poly.pizza as GLB and converted to USDZ with `tools/convert.py`. The script also scales each model to real-world metres and lays out the chosen animations end to end:
+The temple models were downloaded from poly.pizza as GLB and converted to USDZ with `tools/convert.py`, which also scales each one to real-world metres:
 
 ```bash
-blender -b --python tools/convert.py -- panda.glb BrushWatch/Models/Panda.usdz 1.0 Idle Wave Yes Jump Chop_Loop Punch
+blender -b --python tools/convert.py -- pagoda.glb BrushWatch/Models/Pagoda.usdz 9.0
 ```
-
-If you change the panda's clip list, copy the printed frame ranges into `PandaDirector.ranges`.
 
 ## Bao, the panda
 
