@@ -1,6 +1,30 @@
 import CoreBluetooth
 import Foundation
 
+// MARK: - Sonicare GATT map
+//
+// From community reverse engineering (github.com/mtheli/philips_sonicare_ble, const.py).
+// Applies to the "classic" protocol: Sonicare for Kids HX63xx, DiamondClean, ExpertClean…
+// The newer Kids HX6600 and Series 7100 use the "Condor" protocol instead (not supported yet).
+enum Sonicare {
+    static let handleState   = CBUUID(string: "477EA600-A260-11E4-AE37-0002A5D54010") // uint8
+    static let brushingState = CBUUID(string: "477EA600-A260-11E4-AE37-0002A5D54082") // uint8
+    static let brushingTime  = CBUUID(string: "477EA600-A260-11E4-AE37-0002A5D54090") // uint16 LE, seconds
+    static let battery       = CBUUID(string: "2A19")                                 // uint8, %
+    static let condorService = CBUUID(string: "E50BA3C0-AF04-4564-92AD-FEF019489DE6")
+
+    static let watched: Set<CBUUID> = [handleState, brushingState, brushingTime, battery]
+
+    static let handleStates: [UInt8: String] = [
+        0: "off", 1: "standby", 2: "run", 3: "charge", 4: "shutdown", 6: "validate", 7: "background",
+    ]
+    static let brushingStates: [UInt8: String] = [
+        0: "off", 1: "on", 2: "pause", 3: "session complete", 4: "session aborted",
+    ]
+    static let handleRunning: UInt8 = 2
+    static let brushingOn: UInt8 = 1
+}
+
 /// A device seen in a BLE advertisement.
 struct SeenDevice: Identifiable {
     let id: UUID
@@ -10,12 +34,10 @@ struct SeenDevice: Identifiable {
     var serviceUUIDs: [CBUUID]
     var manufacturerData: Data?
 
-    /// Philips Sonicare brushes advertise names like "Philips Sonicare" and use
-    /// custom service UUIDs starting with 477ea600-a260-11e4-ae37-0002a5d5.
     var looksLikeSonicare: Bool {
         let n = name.lowercased()
         if n.contains("sonicare") || n.contains("philips") { return true }
-        return serviceUUIDs.contains { $0.uuidString.uppercased().hasPrefix("477EA600") }
+        return serviceUUIDs.contains { $0.uuidString.uppercased().hasPrefix("477EA600") || $0 == Sonicare.condorService }
     }
 }
 
@@ -25,7 +47,7 @@ struct BrushEvent: Identifiable {
     let text: String
 }
 
-/// A GATT characteristic found while exploring a connected device.
+/// A GATT characteristic found on a connected device.
 struct CharInfo: Identifiable {
     var id: String { "\(serviceUUID.uuidString)/\(uuid.uuidString)" }
     let serviceUUID: CBUUID
@@ -40,6 +62,16 @@ struct CharInfo: Identifiable {
         return value.map { String(format: "%02X", $0) }.joined(separator: " ")
     }
 
+    var label: String? {
+        switch uuid {
+        case Sonicare.handleState: "Handle state"
+        case Sonicare.brushingState: "Brushing state"
+        case Sonicare.brushingTime: "Brushing time"
+        case Sonicare.battery: "Battery"
+        default: nil
+        }
+    }
+
     var propsText: String {
         var p: [String] = []
         if properties.contains(.read) { p.append("read") }
@@ -50,37 +82,44 @@ struct CharInfo: Identifiable {
     }
 }
 
+enum Link: Equatable {
+    case idle, waiting, connecting, connected, unsupported(String)
+}
+
 final class BLEManager: NSObject, ObservableObject {
     // MARK: Published state
     @Published private(set) var bluetoothState: CBManagerState = .unknown
     @Published private(set) var devices: [UUID: SeenDevice] = [:]
-    @Published private(set) var brushOn = false
-    @Published private(set) var onSince: Date?
-    @Published private(set) var events: [BrushEvent] = []
     @Published var brushID: UUID? {
-        didSet { UserDefaults.standard.set(brushID?.uuidString, forKey: "brushID") }
+        didSet {
+            UserDefaults.standard.set(brushID?.uuidString, forKey: "brushID")
+            if oldValue != brushID { switchBrush(from: oldValue) }
+        }
     }
 
-    // Explore (GATT) state
-    @Published private(set) var exploring: UUID?
-    @Published private(set) var connectionStatus = ""
-    @Published private(set) var characteristics: [CharInfo] = []
+    // Brush link + decoded state
+    @Published private(set) var link: Link = .idle
+    @Published private(set) var handleState: UInt8?
+    @Published private(set) var brushingState: UInt8?
+    @Published private(set) var brushingTime: Int?
+    @Published private(set) var battery: Int?
+    @Published private(set) var brushOn = false
+    @Published private(set) var events: [BrushEvent] = []
 
-    /// How long without an advertisement before we decide the brush went to sleep.
-    let offTimeout: TimeInterval = 4
+    /// Characteristics per connected device (for the Explore sheet).
+    @Published private(set) var chars: [UUID: [CharInfo]] = [:]
+    @Published private(set) var exploreStatus: [UUID: String] = [:]
 
     // MARK: Private
     private var central: CBCentralManager!
     private var peripherals: [UUID: CBPeripheral] = [:]
-    private var timer: Timer?
+    private var exploring: Set<UUID> = []
+    private var lastBrushingTime = 0
 
     override init() {
         super.init()
         if let s = UserDefaults.standard.string(forKey: "brushID") { brushID = UUID(uuidString: s) }
         central = CBCentralManager(delegate: self, queue: .main)
-        timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
-            self?.updatePresence()
-        }
     }
 
     var sortedDevices: [SeenDevice] {
@@ -92,45 +131,54 @@ final class BLEManager: NSObject, ObservableObject {
 
     var brush: SeenDevice? { brushID.flatMap { devices[$0] } }
 
-    func clearDevices() { devices = devices.filter { $0.key == brushID } }
-
-    // MARK: Scanning
-
-    private func startScan() {
-        guard central.state == .poweredOn else { return }
-        // Duplicates on so every advertisement refreshes lastSeen (works in foreground only on iOS).
-        central.scanForPeripherals(withServices: nil,
-                                   options: [CBCentralManagerScanOptionAllowDuplicatesKey: true])
+    var handleStateText: String {
+        guard let h = handleState else { return "—" }
+        return Sonicare.handleStates[h] ?? "unknown (\(h))"
     }
 
-    // MARK: Presence detection
+    var brushingStateText: String {
+        guard let b = brushingState else { return "—" }
+        return Sonicare.brushingStates[b] ?? "unknown (\(b))"
+    }
 
-    private func updatePresence() {
-        guard let id = brushID else {
-            if brushOn { setBrushOn(false) }
-            return
+    func clearDevices() { devices = devices.filter { $0.key == brushID || peripherals[$0.key]?.state == .connected } }
+
+    // MARK: Brush link
+
+    private func switchBrush(from old: UUID?) {
+        if let old, let p = peripherals[old], !exploring.contains(old) { central?.cancelPeripheralConnection(p) }
+        resetBrushState()
+        connectBrush()
+    }
+
+    private func resetBrushState() {
+        handleState = nil; brushingState = nil; brushingTime = nil; battery = nil
+        updateOn()
+        link = brushID == nil ? .idle : .waiting
+    }
+
+    /// iOS connect requests never time out: the phone connects as soon as the brush wakes up and advertises.
+    private func connectBrush() {
+        guard let central, central.state == .poweredOn, let id = brushID else { return }
+        let p = peripherals[id] ?? central.retrievePeripherals(withIdentifiers: [id]).first
+        guard let p else { link = .waiting; return }
+        peripherals[id] = p
+        if p.state == .disconnected {
+            link = .waiting
+            central.connect(p)
         }
-        // While connected the brush stops advertising, so the connection itself counts as "on".
-        let connected = peripherals[id]?.state == .connected
-        let recentlySeen = devices[id].map { Date().timeIntervalSince($0.lastSeen) < offTimeout } ?? false
-        let on = connected || recentlySeen
-        if on != brushOn { setBrushOn(on) }
     }
 
-    private func setBrushOn(_ on: Bool) {
+    private func updateOn() {
+        let on = handleState == Sonicare.handleRunning || brushingState == Sonicare.brushingOn
+        guard on != brushOn else { return }
         brushOn = on
         if on {
-            onSince = Date()
-            log("🪥 Brush turned ON")
+            lastBrushingTime = 0
+            log("🪥 Brushing started")
         } else {
-            let end = min(brush?.lastSeen ?? Date(), Date())
-            if let start = onSince {
-                let secs = Int(max(0, end.timeIntervalSince(start)))
-                log("💤 Brush OFF — awake for \(secs / 60):\(String(format: "%02d", secs % 60))")
-            } else {
-                log("💤 Brush OFF")
-            }
-            onSince = nil
+            let secs = lastBrushingTime
+            log("✅ Brushing stopped — \(secs / 60):\(String(format: "%02d", secs % 60))")
         }
     }
 
@@ -139,29 +187,53 @@ final class BLEManager: NSObject, ObservableObject {
         if events.count > 100 { events.removeLast() }
     }
 
-    // MARK: Explore (connect + dump GATT)
+    // MARK: Explore
 
     func explore(_ id: UUID) {
-        if let current = exploring, let p = peripherals[current] { central.cancelPeripheralConnection(p) }
         guard let p = peripherals[id] else { return }
-        exploring = id
-        characteristics = []
-        connectionStatus = "Connecting…"
+        exploring.insert(id)
+        if p.state == .connected {
+            // Brush link only subscribed to the known characteristics; open everything up for exploring.
+            for ch in p.services?.flatMap({ $0.characteristics ?? [] }) ?? [] {
+                if ch.properties.contains(.read) { p.readValue(for: ch) }
+                if ch.properties.contains(.notify) || ch.properties.contains(.indicate) { p.setNotifyValue(true, for: ch) }
+            }
+            return
+        }
+        exploreStatus[id] = "Connecting…"
         central.connect(p)
     }
 
-    func stopExploring() {
-        if let id = exploring, let p = peripherals[id] { central.cancelPeripheralConnection(p) }
-        exploring = nil
-        characteristics = []
-        connectionStatus = ""
+    func stopExploring(_ id: UUID) {
+        exploring.remove(id)
+        if id != brushID, let p = peripherals[id] { central.cancelPeripheralConnection(p) }
     }
 
-    func read(_ c: CharInfo) {
-        guard let p = exploring.flatMap({ peripherals[$0] }),
+    func read(_ c: CharInfo, on id: UUID) {
+        guard let p = peripherals[id],
               let ch = p.services?.first(where: { $0.uuid == c.serviceUUID })?
                 .characteristics?.first(where: { $0.uuid == c.uuid }) else { return }
         p.readValue(for: ch)
+    }
+
+    // MARK: Decoding
+
+    private func handle(_ uuid: CBUUID, _ data: Data) {
+        guard let first = data.first else { return }
+        switch uuid {
+        case Sonicare.handleState:
+            handleState = first
+        case Sonicare.brushingState:
+            brushingState = first
+        case Sonicare.brushingTime where data.count >= 2:
+            brushingTime = Int(data[data.startIndex]) | Int(data[data.startIndex + 1]) << 8
+            if brushOn, let t = brushingTime { lastBrushingTime = t }
+        case Sonicare.battery:
+            battery = Int(first)
+        default:
+            return
+        }
+        updateOn()
     }
 }
 
@@ -170,14 +242,16 @@ final class BLEManager: NSObject, ObservableObject {
 extension BLEManager: CBCentralManagerDelegate {
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
         bluetoothState = central.state
-        if central.state == .poweredOn { startScan() }
+        guard central.state == .poweredOn else { return }
+        central.scanForPeripherals(withServices: nil,
+                                   options: [CBCentralManagerScanOptionAllowDuplicatesKey: true])
+        connectBrush()
     }
 
     func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral,
                         advertisementData: [String: Any], rssi RSSI: NSNumber) {
         peripherals[peripheral.identifier] = peripheral
-        let advName = advertisementData[CBAdvertisementDataLocalNameKey] as? String
-        let name = advName ?? peripheral.name ?? "Unknown"
+        let name = advertisementData[CBAdvertisementDataLocalNameKey] as? String ?? peripheral.name ?? "Unknown"
         let services = advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID] ?? []
         let mfg = advertisementData[CBAdvertisementDataManufacturerDataKey] as? Data
 
@@ -189,21 +263,33 @@ extension BLEManager: CBCentralManagerDelegate {
         if !services.isEmpty { d.serviceUUIDs = services }
         if let mfg { d.manufacturerData = mfg }
         devices[peripheral.identifier] = d
+
+        if peripheral.identifier == brushID, peripheral.state == .disconnected { connectBrush() }
     }
 
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
-        connectionStatus = "Connected — discovering services…"
+        let id = peripheral.identifier
+        if id == brushID { link = .connecting }
+        exploreStatus[id] = "Connected — discovering services…"
+        chars[id] = []
         peripheral.delegate = self
         peripheral.discoverServices(nil)
     }
 
     func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
-        connectionStatus = "Failed to connect: \(error?.localizedDescription ?? "unknown")"
+        exploreStatus[peripheral.identifier] = "Failed to connect: \(error?.localizedDescription ?? "unknown")"
+        if peripheral.identifier == brushID { connectBrush() }
     }
 
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
-        guard peripheral.identifier == exploring else { return }
-        connectionStatus = "Disconnected\(error.map { " (\($0.localizedDescription))" } ?? "")"
+        let id = peripheral.identifier
+        exploreStatus[id] = "Disconnected\(error.map { " (\($0.localizedDescription))" } ?? "")"
+        if id == brushID {
+            // The brush drops the link when it goes to sleep: that means it's not running.
+            if brushOn { log("💤 Brush went to sleep") }
+            resetBrushState()
+            connectBrush()
+        }
     }
 }
 
@@ -211,29 +297,46 @@ extension BLEManager: CBCentralManagerDelegate {
 
 extension BLEManager: CBPeripheralDelegate {
     func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
-        for s in peripheral.services ?? [] { peripheral.discoverCharacteristics(nil, for: s) }
+        let services = peripheral.services ?? []
+        if peripheral.identifier == brushID {
+            let classic = services.contains { $0.uuid.uuidString.uppercased().hasPrefix("477EA600") }
+            let condor = services.contains { $0.uuid == Sonicare.condorService }
+            if !classic && condor {
+                link = .unsupported("This brush uses Philips' newer \"Condor\" protocol (e.g. Kids HX6600). Not supported yet.")
+            } else if !classic {
+                link = .unsupported("No Sonicare service found on this device. Is it the brush?")
+            }
+        }
+        for s in services { peripheral.discoverCharacteristics(nil, for: s) }
     }
 
     func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
+        let id = peripheral.identifier
+        let isBrush = id == brushID
         for ch in service.characteristics ?? [] {
-            characteristics.append(CharInfo(serviceUUID: service.uuid, uuid: ch.uuid, properties: ch.properties))
+            chars[id, default: []].append(CharInfo(serviceUUID: service.uuid, uuid: ch.uuid, properties: ch.properties))
+            // For the brush, only subscribe to what we need; for Explore, subscribe to everything.
+            let wanted = !isBrush || exploring.contains(id) || Sonicare.watched.contains(ch.uuid)
+            guard wanted else { continue }
             if ch.properties.contains(.read) { peripheral.readValue(for: ch) }
             if ch.properties.contains(.notify) || ch.properties.contains(.indicate) {
                 peripheral.setNotifyValue(true, for: ch)
             }
         }
-        connectionStatus = "Connected — \(characteristics.count) characteristics"
+        exploreStatus[id] = "Connected — \(chars[id]?.count ?? 0) characteristics"
+        if isBrush, link == .connecting { link = .connected }
     }
 
     func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
+        let id = peripheral.identifier
+        guard let value = characteristic.value else { return }
+        if id == brushID { handle(characteristic.uuid, value) }
+
         guard let service = characteristic.service,
-              let i = characteristics.firstIndex(where: { $0.uuid == characteristic.uuid && $0.serviceUUID == service.uuid })
+              let i = chars[id]?.firstIndex(where: { $0.uuid == characteristic.uuid && $0.serviceUUID == service.uuid })
         else { return }
-        let new = characteristic.value
-        if characteristics[i].value != nil && characteristics[i].value != new {
-            characteristics[i].lastChange = Date()
-        }
-        characteristics[i].value = new
-        characteristics[i].updates += 1
+        if chars[id]![i].value != nil && chars[id]![i].value != value { chars[id]![i].lastChange = Date() }
+        chars[id]![i].value = value
+        chars[id]![i].updates += 1
     }
 }

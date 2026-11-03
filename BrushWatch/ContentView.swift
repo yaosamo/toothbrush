@@ -18,6 +18,20 @@ struct ContentView: View {
                     }
                 }
 
+                if case .unsupported(let why) = ble.link {
+                    Section { Label(why, systemImage: "xmark.octagon").foregroundStyle(.red) }
+                }
+
+                if ble.brushID != nil {
+                    Section("Brush") {
+                        LabeledContent("Connection", value: linkText)
+                        LabeledContent("Handle state", value: ble.handleStateText)
+                        LabeledContent("Brushing state", value: ble.brushingStateText)
+                        LabeledContent("Brushing time", value: ble.brushingTime.map(format) ?? "—")
+                        LabeledContent("Battery", value: ble.battery.map { "\($0)%" } ?? "—")
+                    }
+                }
+
                 if !ble.events.isEmpty {
                     Section("Log") {
                         ForEach(ble.events.prefix(20)) { e in
@@ -39,10 +53,20 @@ struct ContentView: View {
                         Button("Clear") { ble.clearDevices() }.font(.caption)
                     }
                 } footer: {
-                    Text("Turn the brush on, then tap the device that appears — Sonicare-looking ones are listed first. Tap ⓘ to connect and inspect its characteristics.")
+                    Text("Tap your brush to select it — the app stays connected and reads its real state. Tap ⓘ to inspect raw characteristics.")
                 }
             }
             .navigationTitle("BrushWatch")
+        }
+    }
+
+    private var linkText: String {
+        switch ble.link {
+        case .idle: "—"
+        case .waiting: "Waiting for brush to wake…"
+        case .connecting: "Connecting…"
+        case .connected: "Connected"
+        case .unsupported: "Unsupported"
         }
     }
 
@@ -56,6 +80,8 @@ struct ContentView: View {
     }
 }
 
+func format(_ secs: Int) -> String { "\(secs / 60):\(String(format: "%02d", secs % 60))" }
+
 struct StatusCard: View {
     @EnvironmentObject var ble: BLEManager
 
@@ -64,13 +90,11 @@ struct StatusCard: View {
             Image(systemName: ble.brushOn ? "bolt.fill" : "moon.zzz.fill")
                 .font(.system(size: 44))
                 .symbolEffect(.pulse, isActive: ble.brushOn)
-            Text(ble.brushID == nil ? "Pick your brush below" : (ble.brushOn ? "BRUSH ON" : "Brush off"))
-                .font(.title.bold())
-            if let since = ble.onSince {
-                Text(since, style: .timer).font(.title2.monospacedDigit())
+            Text(title).font(.title.bold())
+            if ble.brushOn {
+                Text(ble.brushingTime.map(format) ?? "0:00").font(.title2.monospacedDigit())
             } else if let b = ble.brush {
-                Text("\(b.name) · last seen \(b.lastSeen.formatted(date: .omitted, time: .standard))")
-                    .font(.caption).foregroundStyle(.secondary)
+                Text(b.name).font(.caption).foregroundStyle(.secondary)
             }
         }
         .frame(maxWidth: .infinity)
@@ -79,6 +103,12 @@ struct StatusCard: View {
         .background(ble.brushOn ? Color.green : Color(.secondarySystemGroupedBackground),
                     in: RoundedRectangle(cornerRadius: 20))
         .animation(.easeInOut, value: ble.brushOn)
+    }
+
+    private var title: String {
+        if ble.brushID == nil { return "Pick your brush below" }
+        if ble.brushOn { return "BRUSHING" }
+        return ble.link == .connected ? "Brush \(ble.handleStateText)" : "Brush asleep"
     }
 }
 
@@ -96,8 +126,7 @@ struct DeviceRow: View {
                     Text(device.name).fontWeight(device.looksLikeSonicare ? .semibold : .regular)
                     if device.looksLikeSonicare { Text("🪥") }
                 }
-                Text("RSSI \(device.rssi) · \(age)")
-                    .font(.caption).foregroundStyle(.secondary)
+                Text("RSSI \(device.rssi)").font(.caption).foregroundStyle(.secondary)
             }
             Spacer()
             Button { showExplore = true } label: { Image(systemName: "info.circle") }
@@ -106,11 +135,6 @@ struct DeviceRow: View {
         .contentShape(Rectangle())
         .onTapGesture { ble.brushID = (ble.brushID == device.id) ? nil : device.id }
         .sheet(isPresented: $showExplore) { ExploreView(device: device) }
-    }
-
-    private var age: String {
-        let s = Int(Date().timeIntervalSince(device.lastSeen))
-        return s < 2 ? "now" : "\(s)s ago"
     }
 }
 
@@ -135,24 +159,25 @@ struct ExploreView: View {
                     }
                 }
                 Section {
-                    Text(ble.connectionStatus.isEmpty ? "Not connected" : ble.connectionStatus)
-                    ForEach(ble.characteristics) { c in
-                        CharRow(c: c).onTapGesture { ble.read(c) }
+                    Text(ble.exploreStatus[device.id] ?? "Not connected")
+                    ForEach(ble.chars[device.id] ?? []) { c in
+                        CharRow(c: c).onTapGesture { ble.read(c, on: device.id) }
                     }
                 } header: {
                     Text("GATT characteristics")
                 } footer: {
-                    Text("Notify characteristics are subscribed automatically. Values that just changed turn orange — press the brush button and watch which one moves. Tap a row to re-read it.")
+                    Text("Values that just changed turn orange. Tap a row to re-read it.")
                 }
             }
             .navigationTitle("Explore")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button("Close") { ble.stopExploring(); dismiss() }
+                    Button("Close") { dismiss() }
                 }
             }
             .onAppear { ble.explore(device.id) }
+            .onDisappear { ble.stopExploring(device.id) }
         }
     }
 }
@@ -164,6 +189,7 @@ struct CharRow: View {
         TimelineView(.periodic(from: .now, by: 0.5)) { ctx in
             let fresh = c.lastChange.map { ctx.date.timeIntervalSince($0) < 2 } ?? false
             VStack(alignment: .leading, spacing: 3) {
+                if let label = c.label { Text(label).font(.caption.bold()) }
                 Text(c.uuid.uuidString).font(.caption2.monospaced()).foregroundStyle(.secondary)
                 Text(c.hex).font(.body.monospaced())
                     .foregroundStyle(fresh ? .orange : .primary)
