@@ -1,0 +1,22 @@
+name: BrushWatch
+options:
+  bundleIdPrefix: com.michael
+  deploymentTarget:
+    iOS: "17.0"
+targets:
+  BrushWatch:
+    type: application
+    platform: iOS
+    sources: [BrushWatch]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.michael.brushwatch
+        DEVELOPMENT_TEAM: 6J57A4298A
+        CODE_SIGN_STYLE: Automatic
+        SWIFT_VERSION: "5.0"
+        TARGETED_DEVICE_FAMILY: "1"
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_NSBluetoothAlwaysUsageDescription: "BrushWatch uses Bluetooth to notice when the toothbrush is turned on."
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents: YES
+        INFOPLIST_KEY_UISupportedInterfaceOrientations: UIInterfaceOrientationPortrait
