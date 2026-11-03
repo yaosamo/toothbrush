@@ -67,7 +67,7 @@ struct BrushSetupView: View {
                 }
 
                 Section("Credits") {
-                    Text("Panda by Quaternius (CC0). Pagoda and Pavilion by Poly by Google, Red Lantern by Sophie Kim — CC-BY 3.0, via poly.pizza.")
+                    Text("Bao the panda is an original BrushWatch character. Pagoda and Pavilion by Poly by Google, Red Lantern by Sophie Kim — CC-BY 3.0, via poly.pizza.")
                         .font(.footnote).foregroundStyle(.secondary)
                 }
             }

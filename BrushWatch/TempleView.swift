@@ -2,18 +2,18 @@ import SwiftUI
 import RealityKit
 import UIKit
 
-/// Drives the panda's animations. Clips are cut out of the single USDZ timeline
-/// (see tools/convert.py, which prints these frame ranges).
+/// Drives Bao's animations. Clips are cut out of the single USDZ timeline
+/// (see tools/build_panda.py, which prints these frame ranges).
 @MainActor
 final class PandaDirector: ObservableObject {
     enum Clip: String, CaseIterable {
-        case idle = "Idle", wave = "Wave", yes = "Yes", jump = "Jump", brush = "Chop_Loop", punch = "Punch"
+        case idle = "Idle", wave = "Wave", brush = "Brush", jump = "Jump", yes = "Yes", giggle = "Giggle"
     }
 
-    // Frame ranges at 30 fps, from convert.py output.
+    // Frame ranges at 30 fps, from build_panda.py output.
     private static let fps = 30.0
     private static let ranges: [Clip: (Double, Double)] = [
-        .idle: (1, 31), .wave: (32, 82), .yes: (83, 133), .jump: (134, 141.5), .brush: (142.5, 162.5), .punch: (163.5, 183.5),
+        .idle: (1, 61), .wave: (62, 122), .brush: (123, 153), .jump: (154, 194), .yes: (195, 235), .giggle: (236, 272),
     ]
 
     private var animated: Entity?
@@ -23,7 +23,7 @@ final class PandaDirector: ObservableObject {
 
     func attach(_ panda: Entity) {
         guard let target = Self.findAnimated(panda), let full = target.availableAnimations.first else {
-            print("[Panda] no animations found")
+            NSLog("[Panda] %@", " no animations found")
             return
         }
         animated = target
@@ -31,9 +31,9 @@ final class PandaDirector: ObservableObject {
             let view = AnimationView(source: full.definition, name: clip.rawValue,
                                      trimStart: (r.0 - 1) / Self.fps, trimEnd: (r.1 - 1) / Self.fps)
             do { clips[clip] = try AnimationResource.generate(with: view) }
-            catch { print("[Panda] clip \(clip.rawValue) failed: \(error)") }
+            catch { NSLog("[Panda] %@", " clip \(clip.rawValue) failed: \(error)") }
         }
-        print("[Panda] animations on \(target.name): \(target.availableAnimations.count), full \(full.definition.duration)s, clips \(clips.count)")
+        NSLog("[Panda] %@", " animations on \(target.name): \(target.availableAnimations.count), full \(full.definition.duration)s, clips \(clips.count)")
         loop(.idle)
         perform([.wave])
     }
@@ -44,7 +44,7 @@ final class PandaDirector: ObservableObject {
     }
 
     func celebrate() { perform([.jump, .jump, .wave]) }
-    func poke() { if !brushing { perform([.punch]) } }
+    func poke() { if !brushing { perform([.giggle]) } }
 
     /// Plays one-shot clips in order, then returns to the looping state.
     private func perform(_ sequence: [Clip]) {
@@ -128,8 +128,9 @@ enum TempleScene {
             }
         }
 
-        if let panda = try? await Entity(named: "Panda") {
+        if let panda = try? await Entity(named: "Bao") {
             panda.position = [0, 0.08, 0]
+            panda.scale = [0.9, 0.9, 0.9]
             world.addChild(panda)
             director.attach(panda)
         }
