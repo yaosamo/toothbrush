@@ -1,8 +1,9 @@
 import SwiftUI
 import CoreBluetooth
 
-struct ContentView: View {
+struct BrushSetupView: View {
     @EnvironmentObject var ble: BLEManager
+    @EnvironmentObject var store: AchievementStore
 
     var body: some View {
         NavigationStack {
@@ -32,6 +33,15 @@ struct ContentView: View {
                     }
                 }
 
+                Section {
+                    Toggle("Simulate brushing", isOn: Binding(get: { ble.simulating }, set: { ble.simulate($0) }))
+                    Button("Reset achievements", role: .destructive) { store.reset() }
+                } header: {
+                    Text("Testing")
+                } footer: {
+                    Text("Simulation drives the panda exactly like a real brush. Sessions under \(store.minimumSeconds)s don't count.")
+                }
+
                 if !ble.events.isEmpty {
                     Section("Log") {
                         ForEach(ble.events.prefix(20)) { e in
@@ -55,8 +65,13 @@ struct ContentView: View {
                 } footer: {
                     Text("Tap your brush to select it — the app stays connected and reads its real state. Tap ⓘ to inspect raw characteristics.")
                 }
+
+                Section("Credits") {
+                    Text("Panda by Quaternius (CC0). Pagoda and Pavilion by Poly by Google, Red Lantern by Sophie Kim — CC-BY 3.0, via poly.pizza.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
             }
-            .navigationTitle("BrushWatch")
+            .navigationTitle("Brush")
         }
     }
 

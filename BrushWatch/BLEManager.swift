@@ -115,6 +115,12 @@ final class BLEManager: NSObject, ObservableObject {
     private var peripherals: [UUID: CBPeripheral] = [:]
     private var exploring: Set<UUID> = []
     private var lastBrushingTime = 0
+    private var startedAt: Date?
+    private var simTimer: Timer?
+
+    /// Called with the session length in seconds whenever brushing stops.
+    var onSessionEnded: ((Int) -> Void)?
+    @Published private(set) var simulating = false
 
     override init() {
         super.init()
@@ -175,11 +181,35 @@ final class BLEManager: NSObject, ObservableObject {
         brushOn = on
         if on {
             lastBrushingTime = 0
+            startedAt = Date()
             log("🪥 Brushing started")
         } else {
-            let secs = lastBrushingTime
+            // Prefer the brush's own timer; fall back to wall-clock time if it doesn't report one.
+            let wall = startedAt.map { Int(Date().timeIntervalSince($0)) } ?? 0
+            let secs = lastBrushingTime > 0 ? lastBrushingTime : wall
+            startedAt = nil
             log("✅ Brushing stopped — \(secs / 60):\(String(format: "%02d", secs % 60))")
+            onSessionEnded?(secs)
         }
+    }
+
+    // MARK: Simulation (test the game without a brush)
+
+    func simulate(_ on: Bool) {
+        simulating = on
+        simTimer?.invalidate()
+        if on {
+            handleState = Sonicare.handleRunning
+            brushingTime = 0
+            simTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+                guard let self else { return }
+                self.handle(Sonicare.brushingTime, Data([UInt8((self.brushingTime ?? 0) + 1 & 0xFF),
+                                                         UInt8(((self.brushingTime ?? 0) + 1) >> 8)]))
+            }
+        } else {
+            handleState = 1
+        }
+        updateOn()
     }
 
     private func log(_ text: String) {
